@@ -314,7 +314,7 @@ impl PolymarketFeed {
     }
 
     async fn run(&self) -> Result<(), Box<dyn Error>> {
-        println!("POLYMARKET BTC/ETH 15-MINUTE REAL-TIME FEED");
+        println!("POLYMARKET BTC 15-MINUTE FEED");
         println!("{}", "=".repeat(100));
         
         loop {
@@ -327,17 +327,14 @@ impl PolymarketFeed {
                 }
                 Ok(None) => {
                     println!("\nNo active market found");
-                    println!("Possible reasons:");
-                    println!("  - No BTC/ETH 15-minute markets active");
-                    println!("  - Market slug format changed");
-                    println!("  - API temporarily unavailable");
+                    
                 }
                 Err(e) => {
                     println!("\nError: {}", e);
                 }
             }
             
-            println!("\nRetrying in 10 seconds...");
+            println!("\nRetrying in 10 seconds: ");
             sleep(Duration::from_secs(10)).await;
         }
     }
