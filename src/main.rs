@@ -1,4 +1,4 @@
-﻿use serde::Deserialize;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -213,7 +213,6 @@ impl PolymarketFeed {
 
         let slugs = vec![
             format!("btc-updown-15m-{}", market_time),
-            format!("eth-updown-15m-{}", market_time),
         ];
 
         for slug in &slugs {
@@ -285,8 +284,8 @@ impl PolymarketFeed {
         
         let mut state = MarketState::new(up_token, down_token);
         
-        println!("Starting real-time feed for: {}", question);
-        println!("{}", "=".repeat(100));
+        println!("Starting feed for: {}", question);
+        println!("{}", "-".repeat(100));
         
         while let Some(msg) = read.next().await {
             match msg {
@@ -314,8 +313,8 @@ impl PolymarketFeed {
     }
 
     async fn run(&self) -> Result<(), Box<dyn Error>> {
-        println!("POLYMARKET BTC 15-MINUTE FEED");
-        println!("{}", "=".repeat(100));
+        println!("POLYMARKET BTC FEED");
+        println!("{}", "-".repeat(100));
         
         loop {
             match self.get_current_market().await {
@@ -327,7 +326,6 @@ impl PolymarketFeed {
                 }
                 Ok(None) => {
                     println!("\nNo active market found");
-                    
                 }
                 Err(e) => {
                     println!("\nError: {}", e);
@@ -344,7 +342,7 @@ impl PolymarketFeed {
 async fn main() -> Result<(), Box<dyn Error>> {
     let feed = PolymarketFeed::new();
     
-    println!("Starting feed...");
+    println!("Starting feed: ");
     println!("Press Ctrl+C to stop\n");
     
     if let Err(e) = feed.run().await {
