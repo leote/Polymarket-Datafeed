@@ -4,8 +4,7 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use futures_util::{StreamExt, SinkExt};
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Write};
 
 #[derive(Debug, Deserialize)]
 struct Market {
@@ -13,6 +12,8 @@ struct Market {
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: String,
     active: bool,
+    #[serde(rename = "endDate")]
+    end_date: Option<String>,
 }
 
 struct OrderbookSide {
@@ -23,6 +24,7 @@ struct OrderbookSide {
 struct MarketState {
     up_token: String,
     down_token: String,
+    market_end: Option<chrono::DateTime<chrono::Utc>>,
     
     up_orderbook: OrderbookSide,
     down_orderbook: OrderbookSide,
@@ -40,27 +42,18 @@ struct MarketState {
     trade_updates: u64,
     
     last_print: Instant,
-    csv_file: Option<std::fs::File>,
+    last_update: Instant,
 }
 
 impl MarketState {
-    fn new(up_token: String, down_token: String) -> Self {
-        let csv_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("market_data.csv")
-            .ok();
-        
-        if let Some(ref mut file) = csv_file.as_ref() {
-            let metadata = std::fs::metadata("market_data.csv").unwrap();
-            if metadata.len() == 0 {
-                let _ = writeln!(file, "timestamp,up_bid,up_ask,up_spread,down_bid,down_ask,down_spread,combined_ask");
-            }
-        }
+    fn new(up_token: String, down_token: String, end_date: Option<String>) -> Self {
+        let market_end = end_date.and_then(|d| chrono::DateTime::parse_from_rfc3339(&d).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
         
         Self {
             up_token,
             down_token,
+            market_end,
             up_orderbook: OrderbookSide { bids: Vec::new(), asks: Vec::new() },
             down_orderbook: OrderbookSide { bids: Vec::new(), asks: Vec::new() },
             up_bid: 0.0,
@@ -73,7 +66,18 @@ impl MarketState {
             book_updates: 0,
             trade_updates: 0,
             last_print: Instant::now(),
-            csv_file,
+            last_update: Instant::now(),
+        }
+    }
+    
+    fn should_transition(&self) -> bool {
+        if let Some(end_time) = self.market_end {
+            let now = chrono::Utc::now();
+            let time_until_end = end_time.signed_duration_since(now);
+            
+            time_until_end.num_seconds() < 10
+        } else {
+            false
         }
     }
     
@@ -104,6 +108,7 @@ impl MarketState {
     
     fn handle_message(&mut self, text: &str) {
         self.message_count += 1;
+        self.last_update = Instant::now();
         
         if let Ok(data) = serde_json::from_str::<Value>(text) {
             let event_type = data.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
@@ -162,37 +167,44 @@ impl MarketState {
                 _ => {}
             }
             
-            self.print_state();
-            self.last_print = Instant::now();
+            if self.last_print.elapsed() >= Duration::from_millis(100) {
+                self.print_state();
+                self.last_print = Instant::now();
+            }
         }
     }
     
-    fn print_state(&mut self) {
+    fn print_state(&self) {
         let timestamp = chrono::Local::now().format("%H:%M:%S%.3f");
         
         let combined_ask = self.up_ask + self.down_ask;
         let up_spread = self.up_ask - self.up_bid;
         let down_spread = self.down_ask - self.down_bid;
         
-        println!(
-            "[{}] UP: {:.4}/{:.4} (Spr:{:.4}) | DOWN: {:.4}/{:.4} (Spr:{:.4}) | Combined Ask: {:.4}",
+        print!("\r[{}] UP: {:.4}/{:.4} (Spr:{:.4}) | DOWN: {:.4}/{:.4} (Spr:{:.4}) | Combined: {:.4}",
             timestamp,
             self.up_bid, self.up_ask, up_spread,
             self.down_bid, self.down_ask, down_spread,
             combined_ask
         );
         
-        if let Some(ref mut file) = self.csv_file {
-            let csv_timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-            let _ = writeln!(
-                file,
-                "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
-                csv_timestamp,
-                self.up_bid, self.up_ask, up_spread,
-                self.down_bid, self.down_ask, down_spread,
-                combined_ask
-            );
+        // Show countdown if market is ending soon
+        if let Some(end_time) = self.market_end {
+            let now = chrono::Utc::now();
+            let remaining = end_time.signed_duration_since(now);
+            if remaining.num_seconds() > 0 && remaining.num_seconds() < 60 {
+                print!(" | Ends in {}s", remaining.num_seconds());
+            }
         }
+        
+        let _ = io::stdout().flush();
+    }
+    
+    fn print_stats(&self) {
+        println!("\n\nSession Stats:");
+        println!("  Total messages: {}", self.message_count);
+        println!("  Book updates: {}", self.book_updates);
+        println!("  Trade updates: {}", self.trade_updates);
     }
 }
 
@@ -207,7 +219,7 @@ impl PolymarketFeed {
         }
     }
 
-    async fn get_current_market(&self) -> Result<Option<(String, String, String)>, Box<dyn Error>> {
+    async fn get_current_market(&self) -> Result<Option<(String, String, String, Option<String>)>, Box<dyn Error>> {
         let current_time = chrono::Utc::now().timestamp();
         let market_time = (current_time / 900) * 900;
 
@@ -244,7 +256,12 @@ impl PolymarketFeed {
                                 .collect();
 
                             if token_ids.len() >= 2 {
-                                println!("Found market: {}", market.question);
+                                println!("\nFound market: {}", market.question);
+                                if let Some(ref end_date) = market.end_date {
+                                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(end_date) {
+                                        println!("Market ends: {}", dt.format("%Y-%m-%d %H:%M:%S UTC"));
+                                    }
+                                }
                                 println!("UP token: {}", &token_ids[0]);
                                 println!("DOWN token: {}", &token_ids[1]);
 
@@ -252,6 +269,7 @@ impl PolymarketFeed {
                                     token_ids[0].clone(),
                                     token_ids[1].clone(),
                                     market.question,
+                                    market.end_date,
                                 )));
                             }
                         }
@@ -264,7 +282,7 @@ impl PolymarketFeed {
         Ok(None)
     }
 
-    async fn connect_websocket(&self, up_token: String, down_token: String, question: String) -> Result<(), Box<dyn Error>> {
+    async fn connect_websocket(&self, up_token: String, down_token: String, question: String, end_date: Option<String>) -> Result<bool, Box<dyn Error>> {
         println!("Connecting to WebSocket...");
         
         let url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -282,34 +300,47 @@ impl PolymarketFeed {
         write.send(tokio_tungstenite::tungstenite::Message::Text(subscription.to_string())).await?;
         println!("Subscribed to tokens\n");
         
-        let mut state = MarketState::new(up_token, down_token);
+        let mut state = MarketState::new(up_token, down_token, end_date);
         
         println!("Starting feed for: {}", question);
         println!("{}", "-".repeat(100));
         
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                    state.handle_message(&text);
+        let mut transition_check = tokio::time::interval(Duration::from_secs(1));
+        
+        loop {
+            tokio::select! {
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                            state.handle_message(&text);
+                        }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => {
+                            println!("\n\nWebSocket closed by server");
+                            state.print_stats();
+                            return Ok(false);
+                        }
+                        Some(Err(e)) => {
+                            println!("\n\nWebSocket error: {}", e);
+                            state.print_stats();
+                            return Err(Box::new(e));
+                        }
+                        None => {
+                            println!("\n\nWebSocket stream ended");
+                            state.print_stats();
+                            return Ok(false);
+                        }
+                        _ => {}
+                    }
                 }
-                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                    println!("\nWebSocket closed by server");
-                    break;
+                _ = transition_check.tick() => {
+                    if state.should_transition() {
+                        println!("\n\nMarket ending in 10 seconds, preparing to transition...");
+                        state.print_stats();
+                        return Ok(true);
+                    }
                 }
-                Err(e) => {
-                    println!("\nWebSocket error: {}", e);
-                    break;
-                }
-                _ => {}
             }
         }
-        
-        println!("\nDisconnected. Stats:");
-        println!("  Total messages: {}", state.message_count);
-        println!("  Book updates: {}", state.book_updates);
-        println!("  Trade updates: {}", state.trade_updates);
-        
-        Ok(())
     }
 
     async fn run(&self) -> Result<(), Box<dyn Error>> {
@@ -318,22 +349,34 @@ impl PolymarketFeed {
         
         loop {
             match self.get_current_market().await {
-                Ok(Some((up_token, down_token, question))) => {
-                    match self.connect_websocket(up_token, down_token, question).await {
-                        Ok(_) => println!("\nWebSocket disconnected normally"),
-                        Err(e) => println!("\nWebSocket error: {}", e),
+                Ok(Some((up_token, down_token, question, end_date))) => {
+                    match self.connect_websocket(up_token, down_token, question, end_date).await {
+                        Ok(should_transition) => {
+                            if should_transition {
+                                println!("Transitioning to next market...");
+                                sleep(Duration::from_secs(5)).await;
+                            } else {
+                                println!("\nWebSocket disconnected normally");
+                                sleep(Duration::from_secs(10)).await;
+                            }
+                        }
+                        Err(e) => {
+                            println!("\nWebSocket error: {}", e);
+                            sleep(Duration::from_secs(10)).await;
+                        }
                     }
                 }
                 Ok(None) => {
                     println!("\nNo active market found");
+                    sleep(Duration::from_secs(10)).await;
                 }
                 Err(e) => {
                     println!("\nError: {}", e);
+                    sleep(Duration::from_secs(10)).await;
                 }
             }
             
-            println!("\nRetrying in 10 seconds: ");
-            sleep(Duration::from_secs(10)).await;
+            println!("Retrying...\n");
         }
     }
 }
