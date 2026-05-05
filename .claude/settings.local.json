@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(timeout 5 ./target/debug/polymarket-btc-feed)",
+      "Bash(timeout 8 ./target/debug/polymarket-btc-feed)"
+    ]
+  }
+}
